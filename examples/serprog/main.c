@@ -16,7 +16,10 @@
 #include "serprog.h"
 
 #define LED_PIN  3
+#define MODE_PIN 4
 SBIT(LED, 0xb0, LED_PIN);
+SBIT(BUTTON, 0xb0, MODE_PIN);
+
 #define CS_PIN  0
 SBIT(CS, 0x90, CS_PIN);
 
@@ -33,6 +36,9 @@ SBIT(CS, 0x90, CS_PIN);
     (1L << S_CMD_O_SPIOP)      \
 )
 #define BUS_SPI (1 << 3)
+
+uint8_t mode = 0;
+/* 0: spi prog, 1: uart */
 
 __xdata __at (0x0000) uint8_t  Ep0Buffer[DEFAULT_ENDP0_SIZE];      // Endpoint 0 OUT & IN buffer, must be an even address
 __xdata __at (0x0040) uint8_t  Ep1Buffer[DEFAULT_ENDP1_SIZE];       //Endpoint 1 upload buffer
@@ -57,7 +63,7 @@ __code uint8_t DevDesc[] = {0x12,0x01,0x10,0x01,0x02,0x00,0x00,DEFAULT_ENDP0_SIZ
 __code uint8_t CfgDesc[] ={
     0x09,0x02,0x43,0x00,0x02,0x01,0x00,0xa0,0x32,             //Configuration descriptor (two interfaces)
 // The following is the interface 0 (CDC interface) descriptor
-    0x09,0x04,0x00,0x00,0x01,0x02,0x02,0x01,0x00, // CDC interface descriptor (one endpoint)
+    0x09,0x04,0x00,0x00,0x01,0x02,0x02,0x01,0x00, // CDC interface descriptor (one endpoint)
     //The following is the function descriptor
     0x05,0x24,0x00,0x10,0x01,                                 //Function descriptor (header)
     0x05,0x24,0x01,0x00,0x00,                                 //Management descriptor (no data interface) 03 01
@@ -89,7 +95,13 @@ unsigned char  __code Manuf_Des[]={
 //cdc参数
 __xdata uint8_t LineCoding[7]={0x00,0xe1,0x00,0x00,0x00,0x00,0x08};   //The initial baud rate is 57600, 1 stop bit, no parity, 8 data bits.
 
+#define UART_REV_LEN  64                 //Serial receive buffer size
+__idata uint8_t Receive_Uart_Buf[UART_REV_LEN];   //Serial receive buffer
+volatile __idata uint8_t Uart_Input_Point = 0;   //Circular buffer write pointer, bus reset needs to be initialized to 0
+volatile __idata uint8_t Uart_Output_Point = 0;  //Take pointer out of circular buffer, bus reset needs to be initialized to 0
+volatile __idata uint8_t UartByteCount = 0;      //Number of bytes remaining in the current buffer
 
+volatile __idata uint8_t USBBufOutPoint = 0;    //Fetch data pointer
 
 volatile __idata uint8_t USBByteCount = 0;      //Represents the data received by the USB endpoint
 volatile __idata uint8_t UpPoint2_Busy  = 0;   //Whether the upload endpoint is busy
@@ -150,6 +162,19 @@ void USBDeviceEndPointCfg()
     UEP4_1_MOD = 0X40;                                                         //Endpoint 1 upload buffer; endpoint 0 single 64-byte send and receive buffer
     UEP0_CTRL = UEP_R_RES_ACK | UEP_T_RES_NAK;                                 //Manual flip, OUT transaction returns ACK, IN transaction returns NAK
 }
+
+void Config_Uart0(uint8_t *cfg_uart)
+{
+    uint32_t uart_buad = 0;
+    *((uint8_t *)&uart_buad) = cfg_uart[0];
+    *((uint8_t *)&uart_buad+1) = cfg_uart[1];
+    *((uint8_t *)&uart_buad+2) = cfg_uart[2];
+    *((uint8_t *)&uart_buad+3) = cfg_uart[3];
+
+    TH1 = 256 - FREQ_SYS / uart_buad / 16;
+
+}
+
 /*******************************************************************************
 * Function Name  : DeviceInterrupt()
 * Description    : CH559USB interrupt processing function
@@ -176,6 +201,8 @@ void DeviceInterrupt(void) __interrupt (INT_NO_USB)                       //USB 
             if ( U_TOG_OK )                                                     // 不同步的数据包将丢弃
             {
                 USBByteCount = USB_RX_LEN;                          // Grads length of recieved data
+                if (mode == 1)
+                    USBBufOutPoint = 0;
                 UEP2_CTRL = UEP2_CTRL & ~ MASK_UEP_R_RES | UEP_R_RES_NAK;       //NAK after receiving a packet of data, the main function finishes processing, and the main function modifies the response mode
             }
             break;
@@ -456,6 +483,8 @@ void DeviceInterrupt(void) __interrupt (INT_NO_USB)                       //USB 
                 if( U_TOG_OK )
                 {
                     memcpy(LineCoding,UsbSetupBuf,USB_RX_LEN);
+                    if (mode == 1)
+                        Config_Uart0(LineCoding);
                     UEP0_T_LEN = 0;
                     UEP0_CTRL |= UEP_R_RES_ACK | UEP_T_RES_ACK;  // 准备上传0包
                 }
@@ -483,6 +512,12 @@ void DeviceInterrupt(void) __interrupt (INT_NO_USB)                       //USB 
         UIF_SUSPEND = 0;
         UIF_TRANSFER = 0;
         UIF_BUS_RST = 0;                                                             //清中断标志
+        if (mode == 1)
+        {
+            Uart_Input_Point = 0;   //循环缓冲区输入指针
+            Uart_Output_Point = 0;  //循环缓冲区读出指针
+            UartByteCount = 0;      //当前缓冲区剩余待取字节数
+        }
         USBByteCount = 0;       //USB端点收到的长度
         UsbConfig = 0;          //清除配置值
         UpPoint2_Busy = 0;
@@ -676,40 +711,127 @@ void handle_command()
 
 }
 
+void Uart0_ISR(void) __interrupt (INT_NO_UART0)
+{
+    if(RI)   //收到数据
+    {
+        Receive_Uart_Buf[Uart_Input_Point++] = SBUF;
+        UartByteCount++;                    //Number of bytes remaining in the current buffer
+        if(Uart_Input_Point>=UART_REV_LEN)
+            Uart_Input_Point = 0;           //Write pointer
+        RI=0;
+    }
+}
+
+
+
 void main()
 {
+    uint8_t length;
+    uint8_t Uart_Timeout = 0;
+    uint8_t recievedData[MAX_PACKET_SIZE] ="";
+
     CfgFsys();
     mDelaymS(5);
+
+    P3_DIR_PU &= ~(1 << MODE_PIN);
+    P3_MOD_OC &= ~(1 << MODE_PIN);
+
+    if (BUTTON == 0)
+        mode = 1;
 
     // Configure pin 3.3 as led ctl
     P3_DIR_PU |= (1 << LED_PIN);
     P3_MOD_OC &= ~(1 << LED_PIN);
 
-    // Configure pin 1.0 as spi cs ctl
-    P1_MOD_OC = 0x00 | (1 << 6);
-    P1_DIR_PU = 0;
-    P1_DIR_PU |= ((1 << CS_PIN) | (1 << 5) | (1 << 6) | (1 << 7));
+    if (mode == 0) {
+        // Configure pin 1.0 as spi cs ctl
+        P1_MOD_OC = 0x00 | (1 << 6);
+        P1_DIR_PU = 0;
+        P1_DIR_PU |= ((1 << CS_PIN) | (1 << 5) | (1 << 6) | (1 << 7));
 
-    SPI0_SETUP = 0;                                                       //Master模式,高位在前
-    SPI0_CTRL = 0x60;                                                     //模式0
-    SPI0_CK_SE = 0x02;
+        SPI0_SETUP = 0;                                                       //Master模式,高位在前
+        SPI0_CTRL = 0x60;                                                     //模式0
+        SPI0_CK_SE = 0x02;
 
-    USBDeviceCfg();
-    USBDeviceEndPointCfg();                                               // Endpoint configuration
-    USBDeviceIntCfg();                                                    //Interrupt initialization
-    UEP0_T_LEN = 0;
-    UEP1_T_LEN = 0;                                                       //Pre-use send length must be cleared
-    UEP2_T_LEN = 0;                                                       //Pre-use send length must be cleared
+        USBDeviceCfg();
+        USBDeviceEndPointCfg();                                               // Endpoint configuration
+        USBDeviceIntCfg();                                                    //Interrupt initialization
+        UEP0_T_LEN = 0;
+        UEP1_T_LEN = 0;                                                       //Pre-use send length must be cleared
+        UEP2_T_LEN = 0;                                                       //Pre-use send length must be cleared
 
-    while(!UsbConfig) {
-        LED = !LED;
-        mDelaymS(50);
-    }
-    LED = 0;
-    
-    while(1)
-    {
-        handle_command();
+        while(!UsbConfig) {
+            LED = !LED;
+            mDelaymS(50);
+        }
         LED = 0;
+        
+        while(1)
+        {
+            handle_command();
+            LED = 0;
+        }
+    } else if (mode == 1) {
+        mInitSTDIO( );
+
+        TI = 0;
+
+        USBDeviceCfg();
+        USBDeviceEndPointCfg();                                               // Endpoint configuration
+        USBDeviceIntCfg();                                                    //Interrupt initialization
+        UEP0_T_LEN = 0;
+        UEP1_T_LEN = 0;                                                       //Pre-use send length must be cleared
+        UEP2_T_LEN = 0;
+
+        ES = 1;
+
+        LED = 1;
+        while(1)
+        {
+            if(UsbConfig)
+            {
+                if(USBByteCount)   // USB receiving endpoint has data
+                {
+                    LED = !LED;
+                    CH554UART0SendByte(Ep2Buffer[USBBufOutPoint++]);
+                    recievedData[USBBufOutPoint] = Ep2Buffer[USBBufOutPoint];
+                    USBByteCount--;
+
+                    if(USBByteCount==0)
+                        UEP2_CTRL = UEP2_CTRL & ~ MASK_UEP_R_RES | UEP_R_RES_ACK;
+
+                    LED = !LED;
+
+                }
+                if(UartByteCount)
+                    Uart_Timeout++;
+                if(!UpPoint2_Busy)   // The endpoint is not busy (the first packet of data after idle, only used to trigger upload)
+                {
+                    length = UartByteCount;
+                    if(length>0)
+                    {
+                        if(length>39 || Uart_Timeout>100)
+                        {
+                            LED = !LED;
+                            Uart_Timeout = 0;
+                            if(Uart_Output_Point+length>UART_REV_LEN)
+                                length = UART_REV_LEN-Uart_Output_Point;
+                            UartByteCount -= length;
+                            // write upload endpoint
+                            memcpy(Ep2Buffer+MAX_PACKET_SIZE,&Receive_Uart_Buf[Uart_Output_Point],length);
+
+                            Uart_Output_Point+=length;
+                            if (Uart_Output_Point>=UART_REV_LEN)
+                                Uart_Output_Point = 0;
+                            UEP2_T_LEN = length; // Pre-use send length must be cleared
+                            UEP2_CTRL = UEP2_CTRL & ~ MASK_UEP_T_RES | UEP_T_RES_ACK; // Answer ACK
+                            UpPoint2_Busy = 1;
+                            LED = !LED;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
